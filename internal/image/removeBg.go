@@ -3,6 +3,8 @@ package image
 import (
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"slices"
 
 	bgremoval "github.com/Achno/gowall/internal/backends/bgRemoval"
@@ -11,11 +13,15 @@ import (
 
 // BackgroundProcessor implements the ImageProcessor interface.
 type BackgroundProcessor struct {
-	strategy bgremoval.BgRemovalStrategy
+	strategy      bgremoval.BgRemovalStrategy
+	backgroundClr color.Color
 }
 
-func NewBackgroundProcessor(strategy bgremoval.BgRemovalStrategy) *BackgroundProcessor {
-	return &BackgroundProcessor{strategy: strategy}
+func NewBackgroundProcessor(strategy bgremoval.BgRemovalStrategy, backgroundClr color.Color) *BackgroundProcessor {
+	return &BackgroundProcessor{
+		strategy:      strategy,
+		backgroundClr: backgroundClr,
+	}
 }
 
 func (p *BackgroundProcessor) Process(img image.Image, theme string, format string) (image.Image, types.ImageMetadata, error) {
@@ -26,6 +32,14 @@ func (p *BackgroundProcessor) Process(img image.Image, theme string, format stri
 	newImg, err := p.strategy.Remove(img)
 	if err != nil {
 		return nil, types.ImageMetadata{}, fmt.Errorf("while removing background: %w", err)
+	}
+
+	if p.backgroundClr != nil {
+		bounds := newImg.Bounds()
+		dst := image.NewNRGBA(bounds)
+		draw.Draw(dst, bounds, &image.Uniform{C: p.backgroundClr}, image.Point{}, draw.Src)
+		draw.Draw(dst, bounds, newImg, bounds.Min, draw.Over)
+		newImg = dst
 	}
 
 	return newImg, types.ImageMetadata{}, nil

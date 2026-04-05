@@ -5,8 +5,10 @@ package cmd
 
 import (
 	"fmt"
+	"image/color"
 
 	"github.com/Achno/gowall/config"
+	cpkg "github.com/Achno/gowall/internal/backends/color"
 	"github.com/Achno/gowall/internal/image"
 	imageio "github.com/Achno/gowall/internal/image_io"
 	"github.com/Achno/gowall/internal/logger"
@@ -34,6 +36,7 @@ func BuildBgCmd() *cobra.Command {
 		convergence float64
 		sampleRate  float64
 		numRoutines int
+		bgColor     string
 	)
 
 	flags.StringVarP(&method, "method", "m", "u2net", "Background removal method. Available methods: "+fmt.Sprint(methods))
@@ -41,6 +44,7 @@ func BuildBgCmd() *cobra.Command {
 	flags.IntVarP(&numRoutines, "routines", "r", 4, "Number of goroutines to use")
 	flags.Float64VarP(&convergence, "conv", "c", 0.001, "Convergence threshold")
 	flags.Float64VarP(&sampleRate, "sRate", "s", 0.5, "Sample rate")
+	flags.StringVar(&bgColor, "bg-color", "transparent", "Background color to place behind the cutout. Use 'transparent' to keep alpha")
 
 	cmd.RegisterFlagCompletionFunc("method", bgMethodCompletion)
 
@@ -67,6 +71,16 @@ func RunBgCmd(cmd *cobra.Command, args []string) {
 	sampleRate, err := cmd.Flags().GetFloat64("sRate")
 	utils.HandleError(err, "Error")
 
+	bgColor, err := cmd.Flags().GetString("bg-color")
+	utils.HandleError(err, "Error")
+	var clr color.Color
+	if bgColor != "transparent" {
+		hex, err := cpkg.ParseColorToHex(bgColor)
+		utils.HandleError(err, "Error")
+		clr, err = cpkg.HexToRGBA(hex)
+		utils.HandleError(err, "Error")
+	}
+
 	logger.Print("Removing background...")
 
 	strategy, cleanup, err := image.GetBgStrategy(method, maxIter, convergence, sampleRate, numRoutines)
@@ -75,7 +89,7 @@ func RunBgCmd(cmd *cobra.Command, args []string) {
 		defer cleanup()
 	}
 
-	processor := image.NewBackgroundProcessor(strategy)
+	processor := image.NewBackgroundProcessor(strategy, clr)
 
 	processedImages, err := image.ProcessImgs(processor, imageOps, image.ProcessOptions{
 		Theme:      "",
