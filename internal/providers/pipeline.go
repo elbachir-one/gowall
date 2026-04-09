@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Achno/gowall/config"
 	"github.com/Achno/gowall/internal/image"
 	imageio "github.com/Achno/gowall/internal/image_io"
 	"github.com/Achno/gowall/internal/logger"
@@ -222,15 +223,14 @@ func MapToOCRInput(ops []imageio.ImageIO) ([]*OCRInput, map[int]int, error) {
 			ext := strings.ToLower(filepath.Ext(path))
 			var input *OCRInput
 
-			switch ext {
-			case ".pdf":
+			if config.SupportedTextExtensions[ext] {
 				pdf, err := imageio.LoadFileBytes(op.ImageInput)
 				if err != nil {
 					utils.HandleError(fmt.Errorf("loading PDF %s: %w", path, err))
 					return
 				}
 				input = &OCRInput{Type: InputTypePDF, PDFData: pdf, Filename: path}
-			case ".png", ".jpg", ".jpeg", ".webp":
+			} else if config.SupportedImageExtensions[ext] {
 				img, err := imageio.LoadImage(op.ImageInput)
 				if err != nil {
 					utils.HandleError(fmt.Errorf("loading image %s: %w", path, err))
