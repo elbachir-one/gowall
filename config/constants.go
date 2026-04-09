@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	Version            = "v0.2.3"
+	Version            = "v0.2.4"
 	OutputFolder       = "Pictures/gowall"
 	configFile         = "config.yml"
 	OCRSchemaFile      = "schema.yml"
