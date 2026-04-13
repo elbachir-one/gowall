@@ -6,6 +6,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/Achno/gowall/config"
 	"github.com/Achno/gowall/internal/api"
@@ -26,11 +28,26 @@ func isInputBatch(flags config.GlobalSubCommandFlags) bool {
 	return len(flags.InputFiles) > 0 || len(flags.InputDir) > 0
 }
 
-func openImageInViewer(flags config.GlobalSubCommandFlags, args []string, path string) {
-	if isInputBatch(shared) || imageio.IsStdoutOutput(flags, args) {
+func openImageInViewer(cmd *cobra.Command, flags config.GlobalSubCommandFlags, args []string, path string) {
+	if imageio.IsStdoutOutput(flags, args) {
 		return
 	}
-	err := image.OpenImageInViewer(path)
+
+	if isInputBatch(shared) && !imageio.IsMultiInputSingleOutputCommand(cmd.Name()) {
+		return
+	}
+
+	if cmd.Flags().Changed("preview") {
+		config.GowallConfig.EnableImagePreviewing = flags.PreviewFlag == "true"
+	}
+
+	var err error
+	if strings.EqualFold(filepath.Ext(path), ".gif") {
+		err = image.OpenGifInViewer(path)
+	} else {
+		err = image.OpenImageInViewer(path)
+	}
+
 	if err != nil {
 		logger.Error("Error opening image: ", err)
 	}
@@ -40,9 +57,6 @@ func openImageInViewer(flags config.GlobalSubCommandFlags, args []string, path s
 func validateFlagsCompatibility(cmd *cobra.Command, args []string) error {
 	if len(shared.InputFiles) > 0 && len(shared.InputDir) > 0 {
 		return fmt.Errorf("cannot use --batch and --dir flags together, use one or the other")
-	}
-	if isInputBatch(shared) && len(args) > 0 {
-		return fmt.Errorf("you cant use --batch and normal input or stdout")
 	}
 	if (len(args) == 2 && args[1] == "-") && shared.OutputDestination != "" {
 		return fmt.Errorf("cannot use - pseudofile for stdout and --output flag at the same time")
@@ -57,16 +71,65 @@ func validateInput(flags config.GlobalSubCommandFlags, args []string) error {
 	return fmt.Errorf("no input was given")
 }
 
-// Add common global flags to command
-func addGlobalFlags(cmd *cobra.Command) {
-	cmd.PersistentFlags().StringSliceVar(&shared.InputFiles, "batch", nil, "Usage: --batch file1.png,file2.png... Batch process individual files")
-	cmd.PersistentFlags().StringVar(&shared.InputDir, "dir", "", "Usage --dir [/path/to/dir] Batch process an entire directory")
-	cmd.PersistentFlags().StringVar(&shared.OutputDestination, "output", "", "Usage: --output ~/Folder (works on --dir and --batch also) or --output ~/NewDir/img.png")
+// GlobalFlagBuilder provides a fluent API for adding flags to a cobra command.
+type GlobalFlagBuilder struct {
+	cmd *cobra.Command
 }
 
-// Configure logger and validates flags
+// addFlags returns a FlagBuilder for chaining flag registration methods.
+func addFlags(cmd *cobra.Command) *GlobalFlagBuilder {
+	return &GlobalFlagBuilder{cmd: cmd}
+}
+
+// WithBatch adds the --batch flag for batch processing individual files.
+func (f *GlobalFlagBuilder) WithBatch() *GlobalFlagBuilder {
+	f.cmd.PersistentFlags().StringSliceVar(&shared.InputFiles, "batch", nil, "Usage: --batch file1.png,file2.png... Batch process individual files")
+	return f
+}
+
+// WithDir adds the --dir flag for batch processing an entire directory.
+func (f *GlobalFlagBuilder) WithDir() *GlobalFlagBuilder {
+	f.cmd.PersistentFlags().StringVar(&shared.InputDir, "dir", "", "Usage --dir [/path/to/dir] Batch process an entire directory")
+	return f
+}
+
+// WithOutput adds the --output flag to specify the output destination.
+func (f *GlobalFlagBuilder) WithOutput() *GlobalFlagBuilder {
+	f.cmd.PersistentFlags().StringVar(&shared.OutputDestination, "output", "", "Usage: --output ~/Folder (works on --dir and --batch also) or --output ~/NewDir/img.png")
+	return f
+}
+
+// WithPreview adds the --preview flag to enable or disable image previewing.
+func (f *GlobalFlagBuilder) WithPreview() *GlobalFlagBuilder {
+	f.cmd.PersistentFlags().StringVar(&shared.PreviewFlag, "preview", "", "Usage: --preview true/false enables or disables image previewing (overrides config)")
+	return f
+}
+
+// WithYes adds the --yes flag to auto-accept confirmation prompts.
+func (f *GlobalFlagBuilder) WithYes() *GlobalFlagBuilder {
+	f.cmd.PersistentFlags().BoolVar(&shared.Yes, "yes", false, "Automatically answer yes to confirmation prompts")
+	return f
+}
+
+// addGlobalFlags adds all common global flags to the command.
+func addGlobalFlags(cmd *cobra.Command) {
+	addFlags(cmd).WithBatch().WithDir().WithOutput().WithPreview().WithYes()
+}
+
+// Configure logger, spinner with quiet modes for Unix pipes and redirections and validates flags
 func initCli(cmd *cobra.Command, args []string) error {
 	logger.SetQuiet(imageio.IsStdoutOutput(shared, args))
+	utils.SetSpinnerQuiet(imageio.IsStdoutOutput(shared, args))
+
+	shared.InputFiles = config.ExpandTilde(shared.InputFiles)
+	if shared.InputDir != "" {
+		shared.InputDir = config.ExpandTilde([]string{shared.InputDir})[0]
+	}
+	if shared.OutputDestination != "" {
+		shared.OutputDestination = config.ExpandTilde([]string{shared.OutputDestination})[0]
+	}
+
+	config.GlobalFlags = shared
 	return validateFlagsCompatibility(cmd, args)
 }
 
@@ -74,6 +137,8 @@ func initCli(cmd *cobra.Command, args []string) error {
 func initConfig() {
 	config.LoadConfig()
 	image.LoadCustomThemes()
+	utils.NewSpinner(utils.SpinnerConfig())
+	defer utils.Spinner.Stop()
 }
 
 var rootCmd = &cobra.Command{
@@ -88,13 +153,15 @@ var rootCmd = &cobra.Command{
 			logger.Printf("gowall version: %s\n", config.Version)
 
 		case wallOfTheDayFlag:
-			logger.Print("Fetching wallpaper of the day...")
+			// logger.Print("Fetching wallpaper of the day...")
+			utils.Spinner.Start()
+			utils.Spinner.Message("Fetching wallpaper of the day...")
 			url, err := api.GetWallpaperOfTheDay()
 			utils.HandleError(err, "Could not fetch wallpaper of the day")
 
-			path, err := image.SaveUrlAsImg(url)
+			path, err := imageio.SaveUrlAsImg(url)
 			utils.HandleError(err)
-
+			utils.Spinner.Stop()
 			err = image.OpenImageInViewer(path)
 			utils.HandleError(err)
 

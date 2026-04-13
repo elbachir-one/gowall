@@ -1,56 +1,34 @@
 package image
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
-	"image/gif"
-	"image/jpeg"
-	"image/png"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/Achno/gowall/config"
 	imageio "github.com/Achno/gowall/internal/image_io"
 	"github.com/Achno/gowall/internal/logger"
+	types "github.com/Achno/gowall/internal/types"
 	"github.com/Achno/gowall/terminal"
 	"github.com/Achno/gowall/utils"
-	webp "github.com/HugoSmits86/nativewebp"
+	_ "github.com/gen2brain/avif"
 	_ "golang.org/x/image/webp"
 )
 
-// Available formats to Encode an image in
-var encoders = map[string]func(file *os.File, img image.Image) error{
-	"png": func(file *os.File, img image.Image) error {
-		png := &png.Encoder{
-			CompressionLevel: png.BestSpeed,
-		}
-		return png.Encode(file, img)
-	},
-	"jpg": func(file *os.File, img image.Image) error {
-		return jpeg.Encode(file, img, nil)
-	},
-	"jpeg": func(file *os.File, img image.Image) error {
-		return jpeg.Encode(file, img, nil)
-	},
-	"webp": func(file *os.File, img image.Image) error {
-		return webp.Encode(file, img, nil)
-	},
+// ImageProcessor accepts a single input and processes it into a single output (e.g., png, jpg)
+type ImageProcessor interface {
+	Process(image.Image, string, string) (image.Image, types.ImageMetadata, error)
 }
 
-// Create a Processor of this interface and call 'ProcessImg'
-type ImageProcessor interface {
-	Process(image.Image, string) (image.Image, error)
+// MultiImageProcessor accepts multiple inputs and processes them into a single output (e.g.,gif)
+type MultiImageProcessor interface {
+	Composite([]image.Image, string, string) (image.Image, types.ImageMetadata, error)
 }
 
 // NoOpImageProcessor  implements ImageProcessor but does nothing.
@@ -60,100 +38,25 @@ type ImageProcessor interface {
 type NoOpImageProcessor struct{}
 
 // Implement the Process method
-func (p *NoOpImageProcessor) Process(img image.Image, options string) (image.Image, error) {
+func (p *NoOpImageProcessor) Process(img image.Image, options string, format string) (image.Image, types.ImageMetadata, error) {
 	// Simply return the image without any modifications
-	return img, nil
+	return img, types.ImageMetadata{}, nil
 }
 
-func LoadImage(imgSrc imageio.ImageReader) (image.Image, error) {
-	reader, err := imgSrc.Open()
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	imgData, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	img, _, err := image.Decode(bytes.NewReader(imgData))
-	if err != nil {
-		return nil, fmt.Errorf("unknown format : %s", imgSrc.String())
-	}
-	return img, nil
-}
-
-func SaveImage(img image.Image, output imageio.ImageWriter, format string) error {
-	encoder, ok := encoders[strings.ToLower(format)]
-
-	if !ok {
-		return fmt.Errorf("unsupported format: %s", format)
-	}
-
-	if img == nil {
+// OpenGifInViewer currently supports GIF preview only in Kitty via `kitty icat`.
+func OpenGifInViewer(filePath string) error {
+	if !config.GowallConfig.EnableImagePreviewing {
 		return nil
 	}
-	file, err := output.Create()
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return encoder(file, img)
-}
 
-func SaveGif(gifData gif.GIF, output string) error {
-	var file *os.File
-	if output == "/dev/stdout" || output == "-" || output == "CON" {
-		file = os.Stdout
-	} else {
-		var err error
-		file, err = os.Create(output)
-		if err != nil {
-			return fmt.Errorf("failed to create output file: %w", err)
-		}
-		defer file.Close() // Ensure the file gets closed properly
-	}
-	err := gif.EncodeAll(file, &gifData)
-	if err != nil {
-		return fmt.Errorf("while Encoding gif : %w", err)
+	if !terminal.IsKittyTerminalRunning() {
+		return fmt.Errorf("gif preview is only supported in kitty terminal via `kitty icat`")
 	}
 
-	logger.Printf("Gif processed and saved as %s\n\n", output)
-	return nil
-}
+	cmd := exec.Command("kitty", "icat", filePath)
+	cmd.Stdout = os.Stdout
 
-func SaveUrlAsImg(url string) (string, error) {
-	extension, err := utils.GetFileExtensionFromURL(url)
-	if err != nil {
-		return "", err
-	}
-
-	timestamp := time.Now().Format("20060102-150405")
-	fileName := fmt.Sprintf("wall-%s%s", timestamp, extension)
-
-	path := filepath.Join(config.GowallConfig.OutputFolder, fileName)
-
-	file, err := os.Create(path)
-	if err != nil {
-		return "", fmt.Errorf("could not create file: %w", err)
-	}
-	defer file.Close()
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("could not fetch the URL: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to fetch image: status code %d", resp.StatusCode)
-	}
-
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("could not write to file: %w", err)
-	}
-
-	return path, nil
+	return cmd.Run()
 }
 
 // Opens the image on the default viewing application of every operating system.
@@ -218,8 +121,17 @@ func OpenImageInViewer(filePath string) error {
 	return cmd.Start()
 }
 
+// CompletionFunc is called after each image is processed and saved
+type CompletionFunc func(outputPath string, remaining int)
+
+// ProcessOptions contains options for ProcessImgs
+type ProcessOptions struct {
+	Theme      string
+	OnComplete CompletionFunc // nil = default behavior
+}
+
 // Processes the image depending on a processor that impliments the "ImageProcessor" interface.
-func ProcessImgs(processor ImageProcessor, imageOps []imageio.ImageIO, theme string) ([]string, error) {
+func ProcessImgs(processor ImageProcessor, imageOps []imageio.ImageIO, opts ProcessOptions) ([]string, error) {
 	var wg sync.WaitGroup
 	remaining := int32(len(imageOps))
 	errChan := make(chan error, len(imageOps))
@@ -230,35 +142,40 @@ func ProcessImgs(processor ImageProcessor, imageOps []imageio.ImageIO, theme str
 		wg.Add(1)
 		go func(i int, imgProcessor ImageProcessor, currentImgOp imageio.ImageIO) {
 			defer wg.Done()
-			theme := theme
-			img, err := LoadImage(currentImgOp.ImageInput)
+			theme := opts.Theme
+			img, err := imageio.LoadImage(currentImgOp.ImageInput)
 			if err != nil {
 				errChan <- fmt.Errorf("while loading image: %w", err)
 				return
 			}
 			// optionally specify a temporary theme via json file in runtime
 			if strings.HasSuffix(theme, ".json") {
-				theme, err = loadThemeFromJson(theme)
+				theme, err = LoadThemeFromJson(theme)
 				if err != nil {
 					errChan <- fmt.Errorf("file %s : %w", currentImgOp.ImageInput, err)
 					return
 				}
 			}
 			// Process the image
-			newImg, err := imgProcessor.Process(img, theme)
+			newImg, metadata, err := imgProcessor.Process(img, theme, currentImgOp.Format)
 			if err != nil {
 				errChan <- fmt.Errorf("while processing image: %w", err)
 				return
 			}
 
 			// Save the image
-			err = SaveImage(newImg, currentImgOp.ImageOutput, currentImgOp.Format)
+			err = imageio.SaveImage(newImg, currentImgOp.ImageOutput, currentImgOp.Format, metadata)
 			if err != nil {
 				errChan <- fmt.Errorf("while saving image: %w in %s", err, currentImgOp.ImageOutput)
 				return
 			}
 			remainingCount := atomic.AddInt32(&remaining, -1)
-			logger.Printf("::: Image completed & saved in %s, %d Images left :::\n", currentImgOp.ImageOutput.String(), remainingCount)
+			if opts.OnComplete != nil {
+				opts.OnComplete(currentImgOp.ImageOutput.String(), int(remainingCount))
+			} else {
+				// Default completion message
+				logger.Printf("::: Image completed & saved in %s, %d Images left :::\n", currentImgOp.ImageOutput.String(), remainingCount)
+			}
 			processedImagesFilePaths = append(processedImagesFilePaths, currentImgOp.ImageOutput.String())
 		}(index, processor, imageOp)
 	}
@@ -278,36 +195,65 @@ func ProcessImgs(processor ImageProcessor, imageOps []imageio.ImageIO, theme str
 	return processedImagesFilePaths, nil
 }
 
-// returns themeName that was inserted to the theme map
-func loadThemeFromJson(jsonTheme string) (string, error) {
-	reader, err := os.Open(jsonTheme)
-	if err != nil {
-		return "", fmt.Errorf("error opening image file")
+// MultiCompletionFunc is called after multi-image processing is complete
+type MultiCompletionFunc func(outputPath string, numInputs int)
+
+// MultiProcessOptions contains options for MultiProcessImgs
+type MultiProcessOptions struct {
+	Theme      string
+	OnComplete MultiCompletionFunc // nil = default behavior
+}
+
+// MultiProcessImgs loads multiple images, processes them together via Composite, and saves single output (N:1)
+func MultiProcessImgs(processor MultiImageProcessor, imageOps []imageio.ImageIO, opts MultiProcessOptions) (string, error) {
+
+	var wg sync.WaitGroup
+	images := make([]image.Image, len(imageOps))
+	errChan := make(chan error, len(imageOps))
+
+	for i, imageOp := range imageOps {
+		wg.Add(1)
+		go func(index int, currentImgOp imageio.ImageIO) {
+			defer wg.Done()
+			img, err := imageio.LoadImage(currentImgOp.ImageInput)
+			if err != nil {
+				errChan <- fmt.Errorf("while loading image %s: %w", currentImgOp.ImageInput.String(), err)
+				return
+			}
+			images[index] = img
+		}(i, imageOp)
 	}
-	defer reader.Close()
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return "", fmt.Errorf("while reading the json file")
-	}
-	var tm struct {
-		Name   string   `json:"name"`
-		Colors []string `json:"colors"`
+	wg.Wait()
+	close(errChan)
+
+	// Check for loading errors
+	if len(errChan) > 0 {
+		var errs []error
+		for err := range errChan {
+			errs = append(errs, err)
+		}
+		return "", errors.New(utils.FormatErrors(errs))
 	}
 
-	if err := json.Unmarshal(data, &tm); err != nil {
-		return "", fmt.Errorf("while parsing json theme file, ensure your .json is written correctly")
-	}
-	if len(tm.Name) <= 0 || len(tm.Colors) < 1 {
-		return "", fmt.Errorf("json file does not contain a name or colors field(s)")
-	}
-	clrs, err := HexToRGBASlice(tm.Colors)
+	// All imageOps have the same output and format for multi-input commands
+	output := imageOps[0].ImageOutput
+	format := imageOps[0].Format
+
+	resultImg, metadata, err := processor.Composite(images, opts.Theme, format)
 	if err != nil {
-		return "", err
-	}
-	themes[strings.ToLower(tm.Name)] = Theme{
-		Name:   tm.Name,
-		Colors: clrs,
+		return "", fmt.Errorf("while compositing images: %w", err)
 	}
 
-	return tm.Name, nil
+	err = imageio.SaveImage(resultImg, output, format, metadata)
+	if err != nil {
+		return "", fmt.Errorf("while saving image: %w", err)
+	}
+
+	if opts.OnComplete != nil {
+		opts.OnComplete(output.String(), len(images))
+	} else {
+		// Default completion message
+		logger.Printf("::: Multi-image processing completed & saved in %s :::\n", output.String())
+	}
+	return output.String(), nil
 }

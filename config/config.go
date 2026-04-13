@@ -2,7 +2,6 @@ package config
 
 import (
 	"errors"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,11 +9,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var SupportedExtensions = map[string]bool{
+var SupportedImageExtensions = map[string]bool{
 	".png":  true,
 	".jpeg": true,
 	".jpg":  true,
 	".webp": true,
+	".avif": true,
+}
+
+var SupportedTextExtensions = map[string]bool{
+	".pdf": true,
 }
 
 type GlobalSubCommandFlags struct {
@@ -22,6 +26,8 @@ type GlobalSubCommandFlags struct {
 	InputDir          string
 	InputFiles        []string
 	Format            string
+	PreviewFlag       string
+	Yes               bool
 }
 
 type themeWrapper struct {
@@ -36,9 +42,40 @@ type Options struct {
 	ColorCorrectionBackend string         `yaml:"ColorCorrectionBackend"`
 	OutputFolder           string         `yaml:"OutputFolder"`
 	Themes                 []themeWrapper `yaml:"themes"`
+	EnvConfig              *EnvConfig
+	EnvFilePath            string `yaml:"EnvFilePath"`
+	OnnxRuntimeFolderPath  string `yaml:"OnnxRuntimeFolderPath"`
+	OnnxModelFolderPath    string `yaml:"OnnxModelFolderPath"`
+}
+
+func (o *Options) Resolve() error {
+	var err error
+
+	o.EnvFilePath, err = ResolveHomePath(o.EnvFilePath)
+	if err != nil {
+		return err
+	}
+
+	o.OutputFolder, err = ResolveHomePath(o.OutputFolder)
+	if err != nil {
+		return err
+	}
+
+	o.OnnxRuntimeFolderPath, err = ResolveHomePath(o.OnnxRuntimeFolderPath)
+	if err != nil {
+		return err
+	}
+
+	o.OnnxModelFolderPath, err = ResolveHomePath(o.OnnxModelFolderPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 var GowallConfig = defaultConfig()
+var GlobalFlags GlobalSubCommandFlags
 
 func LoadConfig() {
 	configDir, err := os.UserHomeDir()
@@ -52,19 +89,18 @@ func LoadConfig() {
 	err = os.MkdirAll(configFolder, 0755)
 	if err != nil {
 		log.Fatalf("could not create config directory %v", err)
-		return
 	}
 
-	f, err := os.OpenFile(configPath, os.O_CREATE|os.O_RDONLY, 0o644)
-	if err != nil {
-		log.Printf("Error opening/creating config file: %v", err)
-		return
+	if _, err := os.Stat(filepath.Join(configDir, ".config", "gowall", configFile)); errors.Is(err, os.ErrNotExist) {
+		err = os.WriteFile(filepath.Join(configDir, ".config", "gowall", configFile), []byte(""), 0644)
+		if err != nil {
+			log.Fatalf("could not create config file %v", err)
+		}
 	}
-	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Fatalf("Error reading config : %v", err)
+		log.Printf("Error reading config file: %v", err)
 		return
 	}
 
@@ -74,9 +110,9 @@ func LoadConfig() {
 		return
 	}
 
-	err = os.MkdirAll(configFolder, 0755)
-	if err != nil {
-		log.Fatalf("Error: Could not create config directory: %v", err)
+	if err := GowallConfig.Resolve(); err != nil {
+		log.Printf("Error resolving config: %v", err)
+		return
 	}
 
 	defaultDir, err := CreateDirectory()
@@ -87,4 +123,7 @@ func LoadConfig() {
 	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
 		return
 	}
+
+	EnvConfig := GetEnvConfig(GowallConfig.EnvFilePath)
+	GowallConfig.EnvConfig = EnvConfig
 }

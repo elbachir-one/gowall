@@ -1,19 +1,14 @@
 package image
 
 import (
-	"fmt"
 	"image"
 	"image/color/palette"
 	"image/draw"
 	"image/gif"
-	"path/filepath"
+	"io"
 	"sync"
-	"time"
 
-	"github.com/Achno/gowall/config"
-	imageio "github.com/Achno/gowall/internal/image_io"
-
-	drawx "golang.org/x/image/draw"
+	types "github.com/Achno/gowall/internal/types"
 )
 
 const (
@@ -21,120 +16,52 @@ const (
 	Resize
 )
 
-type GifOptions struct {
-	Loop       int    // 0 loops forever, -1 shows the frames only once, anything else loop+1
-	Delay      int    // Delay in 100ths of a second between frames
-	Mode       int    // Resize (0) NoResize (1) for resizing all images to same dimensions
-	outputName string // outputName of the gif
+// GifProcessor implements MultiImageProcessor for creating animated GIFs
+type GifProcessor struct {
+	Loop  int // 0 loops forever, -1 shows the frames only once, anything else loop+1
+	Delay int // Delay in 100ths of a second between frames
+	Mode  int // Resize (1) NoResize (0) for resizing all images to same dimensions
 }
 
-type GifOption func(*GifOptions)
+// Composite processes multiple images into a single animated GIF
+func (g *GifProcessor) Composite(images []image.Image, theme string, format string) (image.Image, types.ImageMetadata, error) {
 
-func WithLoop(LoopForever int) GifOption {
-	return func(g *GifOptions) { g.Loop = LoopForever }
-}
-
-func WithDelay(delay int) GifOption {
-	return func(g *GifOptions) { g.Delay = delay }
-}
-
-func WithOutputName(name string) GifOption {
-	return func(g *GifOptions) { g.outputName = name }
-}
-
-func WithMode(mode int) GifOption {
-	return func(g *GifOptions) { g.Mode = mode }
-}
-
-func defaultGifOptions(options []GifOption) GifOptions {
-	opts := GifOptions{
-		Loop:       0,
-		Delay:      200,
-		Mode:       Resize,
-		outputName: "",
-	}
-
-	if len(options) > 0 {
-		for _, option := range options {
-			option(&opts)
+	var maxWidth, maxHeight int
+	for _, img := range images {
+		bounds := img.Bounds()
+		width, height := bounds.Dx(), bounds.Dy()
+		if width > maxWidth {
+			maxWidth = width
+		}
+		if height > maxHeight {
+			maxHeight = height
 		}
 	}
-	return opts
-}
 
-func CreateGif(files []imageio.ImageIO, opts ...GifOption) error {
-	options := defaultGifOptions(opts)
-
-	frames, maxWidth, maxHeight, err := scanImages(files)
+	processedImages, err := paletteFramesFromImages(images, maxWidth, maxHeight, g.Mode)
 	if err != nil {
-		return err
-	}
-
-	processedImages, err := paletteFrames(frames, maxWidth, maxHeight, options.Mode)
-	if err != nil {
-		return err
-	}
-
-	if len(processedImages) == 0 {
-		return fmt.Errorf("no images were processed successfully")
+		return nil, types.ImageMetadata{}, err
 	}
 
 	newGif := &gif.GIF{
-		LoopCount: options.Loop,
+		LoopCount: g.Loop,
 		Disposal:  make([]byte, len(processedImages)),
 	}
 
 	for i, img := range processedImages {
 		newGif.Image = append(newGif.Image, img.paletted)
-		newGif.Delay = append(newGif.Delay, options.Delay)
+		newGif.Delay = append(newGif.Delay, g.Delay)
 		newGif.Disposal[i] = gif.DisposalNone
 	}
 
-	fileName := options.outputName
-	if options.outputName == "" {
-		timestamp := time.Now().Format(time.DateTime)
-		fileName = fmt.Sprintf("gif-%s", timestamp)
-		fileName = filepath.Join(config.GowallConfig.OutputFolder, fileName)
+	// Return a custom encoder function in metadata for a very hacky solution to allow Composite() to work with gifs.
+	metadata := types.ImageMetadata{
+		EncoderFunction: func(w io.Writer, img image.Image) error {
+			return gif.EncodeAll(w, newGif)
+		},
 	}
 
-	err = SaveGif(*newGif, fileName)
-	if err != nil {
-		return fmt.Errorf("while saving gif: %w", err)
-	}
-	return nil
-}
-
-// resizeImage resizes an image to the specified width and height while preserving aspect ratio
-func resizeImage(img image.Image, width, height int) image.Image {
-	srcBounds := img.Bounds()
-	srcWidth := srcBounds.Dx()
-	srcHeight := srcBounds.Dy()
-
-	widthRatio := float64(width) / float64(srcWidth)
-	heightRatio := float64(height) / float64(srcHeight)
-
-	// Use the smaller ratio to ensure the image fits within the target dimensions
-	ratio := widthRatio
-	if heightRatio < widthRatio {
-		ratio = heightRatio
-	}
-	newWidth := int(float64(srcWidth) * ratio)
-	newHeight := int(float64(srcHeight) * ratio)
-	dstRect := image.Rect(0, 0, newWidth, newHeight)
-
-	dst := image.NewRGBA(dstRect)
-	drawx.CatmullRom.Scale(dst, dstRect, img, img.Bounds(), draw.Over, nil)
-
-	// Center the image in the target dimensions if needed
-	if newWidth < width || newHeight < height {
-		centered := image.NewRGBA(image.Rect(0, 0, width, height))
-		offsetX := (width - newWidth) / 2
-		offsetY := (height - newHeight) / 2
-		draw.Draw(centered, centered.Bounds(), dst, image.Point{-offsetX, -offsetY}, draw.Over)
-		return centered
-	}
-
-	return dst
+	return nil, metadata, nil
 }
 
 // palleted holds the result of image processing
@@ -143,75 +70,8 @@ type palleted struct {
 	bounds   image.Rectangle
 }
 
-// frames holds both the loaded image and its dimensions
-type frames struct {
-	image         image.Image
-	width, height int
-}
-
-// scanImages loads images and returns their data plus their max dimensions (Frame)
-func scanImages(files []imageio.ImageIO) ([]*frames, int, int, error) {
-	var maxWidth, maxHeight int
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	imageChan := make(chan *frames, len(files))
-	errChan := make(chan error, len(files))
-
-	for _, file := range files {
-		wg.Add(1)
-		go func(f *imageio.ImageIO) {
-			defer wg.Done()
-
-			img, err := LoadImage(f.ImageInput)
-			if err != nil {
-				errChan <- fmt.Errorf("while loading image: %w", err)
-				return
-			}
-
-			bounds := img.Bounds()
-			width, height := bounds.Dx(), bounds.Dy()
-
-			// Update max dimensions thread safe to be used in resizing of the images
-			mu.Lock()
-			if width > maxWidth {
-				maxWidth = width
-			}
-			if height > maxHeight {
-				maxHeight = height
-			}
-			mu.Unlock()
-
-			imageChan <- &frames{
-				image:  img,
-				width:  width,
-				height: height,
-			}
-		}(&file)
-	}
-
-	wg.Wait()
-	close(imageChan)
-	close(errChan)
-
-	select {
-	case err := <-errChan:
-		if err != nil {
-			return nil, 0, 0, err
-		}
-	default:
-	}
-
-	var images []*frames
-	for img := range imageChan {
-		images = append(images, img)
-	}
-
-	return images, maxWidth, maxHeight, nil
-}
-
-// paletteFrames converts frames to paletted with a 216-bit palette and optionally resizes all frames to the same dimensions
-func paletteFrames(images []*frames, maxWidth, maxHeight int, mode int) ([]*palleted, error) {
+// paletteFramesFromImages converts images to paletted with a 216-bit palette and optionally resizes all frames to the same dimensions
+func paletteFramesFromImages(images []image.Image, maxWidth, maxHeight int, mode int) ([]*palleted, error) {
 	const maxWorkers = 5
 	results := make(chan *palleted, len(images))
 	errChan := make(chan error, len(images))
@@ -228,15 +88,12 @@ func paletteFrames(images []*frames, maxWidth, maxHeight int, mode int) ([]*pall
 		var wg sync.WaitGroup
 		for j := i; j < end; j++ {
 			wg.Add(1)
-			go func(imgData *frames) {
+			go func(img image.Image) {
 				defer wg.Done()
-				img := imgData.image
 
 				if mode == Resize {
-					img = resizeImage(img, maxWidth, maxHeight)
+					img = ResizeWithPadding(img, maxWidth, maxHeight)
 				}
-				// Free the original image for garbage collection
-				imgData.image = nil
 
 				// Convert to paletted
 				bounds := img.Bounds()
