@@ -148,16 +148,10 @@ sudo dnf install gowall
 
 More installation options : [here](https://search.nixos.org/packages?channel=24.05&from=0&size=50&sort=relevance&type=packages&query=gowall)
 
-### Void Linux - XBPS-SRC ( Maintainer : [elbachir-one](https://github.com/elbachir-one/))
-
-Assuming you have [void-packages](https://github.com/void-linux/void-packages)
+### Void Linux - ( Maintainer : [elbachir-one](https://github.com/elbachir-one/))
 
 ```sh
-git clone https://github.com/elbachir-one/void-templates
-cd void-templates/ && cp -r gowall/ void-packages/srcpkgs/
-cd void-packages/
-./xbps-src pkg gowall
-sudo xbps-install -R hostdir/binpkgs gowall
+sudo xbps-install -S gowall
 ```
 
 ### Build from source (Cutting Edge) 
